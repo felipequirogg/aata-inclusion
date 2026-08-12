@@ -4,3 +4,19 @@
 body {
   font-family: 'Satoshi', sans-serif;
 }
+
+@keyframes dissolve {
+  0% {
+    opacity: 0;
+    filter: blur(12px);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0px);
+  }
+}
+
+.animate-dissolve {
+  opacity: 0;
+  animation: dissolve 1.2s ease-out forwards;
+}
