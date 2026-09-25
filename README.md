@@ -2,7 +2,14 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
-First, run the development server:
+After cloning, install the versioned git hooks (blocks known supply-chain
+malware indicators before they can be committed — see [SECURITY.md](./SECURITY.md)):
+
+```bash
+bash scripts/setup-hooks.sh
+```
+
+Then run the development server:
 
 ```bash
 npm run dev
@@ -15,6 +22,30 @@ bun dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
+### npm and install-time scripts
+
+This repo ships an `.npmrc` with `ignore-scripts=true` so `npm install` and
+`npm ci` do **not** run dependency install/postinstall scripts by default.
+This blocks the most common supply-chain payload vector.
+
+If a legitimate dependency actually needs its install script (rare — usually
+native-code builds), run it explicitly and only for that package after
+you've reviewed it:
+
+```bash
+# Rebuild native modules that need install scripts (e.g. after a Node upgrade).
+npm rebuild <package>
+
+# Run a package.json script directly (unaffected by ignore-scripts).
+npm run <script>
+```
+
+## Security
+
+If you see a warning from the pre-commit hook or the `security-scan` CI
+workflow, **do not push**. See [SECURITY.md](./SECURITY.md) for the threat
+description, indicators of compromise, and remediation steps.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
