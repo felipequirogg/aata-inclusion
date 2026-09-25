@@ -1,0 +1,116 @@
+name: security-scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:00 ART == 06:00 UTC, daily.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  a12-ioc-scan:
+    name: A12-1309CM IoC scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Scan repo for A12-1309CM indicators
+        shell: bash
+        run: |
+          set -u
+          violations=0
+
+          # Files that legitimately reference the IoCs as documentation.
+          excluded_regex='^(SECURITY\.md|\.githooks/|\.github/workflows/security-scan\.yml$)'
+
+          # Build the list of tracked files, minus excluded docs and .git.
+          mapfile -t files < <(
+            git ls-files -z \
+              | tr '\0' '\n' \
+              | grep -Ev "$excluded_regex" || true
+          )
+
+          fail() {
+            echo "::error ::$*"
+            violations=$((violations + 1))
+          }
+
+          # 1) postcss.config.* size cap (500 bytes).
+          for f in "${files[@]}"; do
+            case "$f" in
+              postcss.config.*|*/postcss.config.*)
+                if [ -f "$f" ]; then
+                  size=$(wc -c < "$f" | tr -d ' ')
+                  if [ "$size" -gt 500 ]; then
+                    fail "$f is ${size} bytes (limit 500). A12-1309CM inflates postcss.config.mjs to ~33 KB."
+                  fi
+                fi
+                ;;
+            esac
+          done
+
+          obfuscated_patterns=(
+            '_0x[a-f0-9]{4,}'
+            'a0_0x[a-f0-9]{4,}'
+            'createRequire.*createRequire'
+            'eval\(atob\('
+          )
+          c2_patterns=(
+            'A12-1309CM'
+            '166\.88\.134\.75'
+            '1rpc\.io/eth'
+            'eth\.drpc\.org'
+            'eth-mainnet\.public\.blastapi\.io'
+          )
+
+          scan_patterns() {
+            local label="$1"; shift
+            local pat file hit
+            for pat in "$@"; do
+              for file in "${files[@]}"; do
+                [ -f "$file" ] || continue
+                # -I skips binaries; -n gives line numbers.
+                hit=$(grep -InE "$pat" -- "$file" 2>/dev/null | head -n 3 || true)
+                if [ -n "$hit" ]; then
+                  while IFS= read -r line; do
+                    fail "$label pattern '$pat' matched in $file: $line"
+                  done <<< "$hit"
+                fi
+              done
+            done
+          }
+
+          scan_patterns "obfuscated-loader" "${obfuscated_patterns[@]}"
+          scan_patterns "C2/campaign"       "${c2_patterns[@]}"
+
+          # 2) .gitignore bot-artifact entries.
+          for f in "${files[@]}"; do
+            case "$f" in
+              .gitignore|*/.gitignore)
+                [ -f "$f" ] || continue
+                for artifact in 'branch_structure\.json' 'temp_auto_push\.bat' 'temp_interactive_push\.bat'; do
+                  hit=$(grep -nE "$artifact" -- "$f" 2>/dev/null || true)
+                  if [ -n "$hit" ]; then
+                    while IFS= read -r line; do
+                      fail ".gitignore artifact '$artifact' in $f: $line"
+                    done <<< "$hit"
+                  fi
+                done
+                ;;
+            esac
+          done
+
+          if [ "$violations" -gt 0 ]; then
+            echo ""
+            echo "::error ::A12-1309CM scan failed with $violations violation(s). See SECURITY.md."
+            exit 1
+          fi
+
+          echo "A12-1309CM scan clean."

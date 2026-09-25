@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block A12-1309CM supply-chain malware indicators.
+# See SECURITY.md for the full threat description.
+#
+# Portable: avoids `mapfile` and `set -u` so it works with macOS Bash 3.2.
+
+RED=$'\033[31m'
+YEL=$'\033[33m'
+BLD=$'\033[1m'
+RST=$'\033[0m'
+
+fail() {
+  echo "${RED}${BLD}[pre-commit] BLOCKED:${RST} $*" >&2
+}
+info() {
+  echo "${YEL}[pre-commit]${RST} $*" >&2
+}
+
+# Files that legitimately contain the IoC strings as documentation.
+is_excluded() {
+  case "$1" in
+    SECURITY.md) return 0 ;;
+    .githooks/*) return 0 ;;
+    .github/workflows/security-scan.yml) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+violations=0
+
+# Collect staged files (Added, Copied, Modified, Renamed) into a tempfile so
+# we don't need mapfile / process substitution quirks.
+staged_list=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ -z "$staged_list" ]; then
+  exit 0
+fi
+
+# 1) postcss.config.* size cap (500 bytes).
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    postcss.config.*|*/postcss.config.*)
+      [ -f "$f" ] || continue
+      size=$(wc -c < "$f" | tr -d ' ')
+      if [ "$size" -gt 500 ]; then
+        fail "'$f' is ${size} bytes (limit 500). A12-1309CM inflates postcss.config.mjs to ~33 KB."
+        violations=$((violations + 1))
+      fi
+      ;;
+  esac
+done <<EOF
+$staged_list
+EOF
+
+obfuscated_patterns='_0x[a-f0-9]{4,}
+a0_0x[a-f0-9]{4,}
+createRequire.*createRequire
+eval\(atob\('
+
+c2_patterns='A12-1309CM
+166\.88\.134\.75
+1rpc\.io/eth
+eth\.drpc\.org
+eth-mainnet\.public\.blastapi\.io'
+
+scan_file_for() {
+  # $1 = file, $2 = label, $3 = newline-separated regex list
+  local file="$1" label="$2" pats="$3" pat hit
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    hit=$(grep -InE "$pat" -- "$file" 2>/dev/null | head -n 3)
+    if [ -n "$hit" ]; then
+      fail "$label pattern '$pat' matched in '$file':"
+      while IFS= read -r line; do
+        echo "    $line" >&2
+      done <<< "$hit"
+      violations=$((violations + 1))
+    fi
+  done <<< "$pats"
+}
+
+# 2 & 3) Obfuscated-loader + C2/campaign patterns.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  if is_excluded "$f"; then continue; fi
+  [ -f "$f" ] || continue
+  scan_file_for "$f" "obfuscated-loader" "$obfuscated_patterns"
+  scan_file_for "$f" "C2/campaign"       "$c2_patterns"
+done <<EOF
+$staged_list
+EOF
+
+# 4) Bot-artifact filenames added to .gitignore.
+gitignore_artifacts='branch_structure\.json
+temp_auto_push\.bat
+temp_interactive_push\.bat'
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    .gitignore|*/.gitignore)
+      [ -f "$f" ] || continue
+      while IFS= read -r artifact; do
+        [ -n "$artifact" ] || continue
+        hit=$(grep -nE "$artifact" -- "$f" 2>/dev/null)
+        if [ -n "$hit" ]; then
+          fail ".gitignore entry '$artifact' is a known A12-1309CM Windows-bot artifact:"
+          while IFS= read -r line; do
+            echo "    $line" >&2
+          done <<< "$hit"
+          violations=$((violations + 1))
+        fi
+      done <<< "$gitignore_artifacts"
+      ;;
+  esac
+done <<EOF
+$staged_list
+EOF
+
+if [ "$violations" -gt 0 ]; then
+  echo "" >&2
+  echo "${RED}${BLD}[pre-commit] $violations violation(s) — commit refused.${RST}" >&2
+  echo "See SECURITY.md for context. If you truly must bypass (dangerous), use: git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0
