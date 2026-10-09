@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Blindaje anti force-push (incidente A12, oct-2026): bloquea empujes forzados o borrados de main/master
+# y subir con configs con código oculto. El script común vive en ~/.milionegle-seguridad.
+# Si ese script no existe en esta máquina, NO bloquea (para no romper otros equipos ni la CI).
+h="$HOME/.milionegle-seguridad/hook-pre-push.sh"
+[ -x "$h" ] && exec "$h" "$@"
+exit 0

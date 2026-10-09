@@ -1,116 +1,142 @@
-name: security-scan
+name: Security Scan
 
+# Corre en cada push (cualquier rama) y en cada PR, a mano (botón «Run workflow») y todos los días.
+# Un push a cualquier rama lo dispara a propósito: el malware A12 reescribe la punta de TODAS las ramas
+# con force-push, y así la rama infectada se pone en rojo (y llega un mail) en el momento.
+# Detecta la familia de malware A12 / «EtherHiding» (incidente de oct-2026): config con payload,
+# tasks.json que se ejecuta al abrir la carpeta, «fuentes» que en realidad son scripts, y sus indicadores.
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
-    # 03:00 ART == 06:00 UTC, daily.
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *' # 3am ART (UTC-3)
 
 permissions:
   contents: read
 
 jobs:
-  a12-ioc-scan:
-    name: A12-1309CM IoC scan
+  scan:
+    name: security-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # Acción fijada por commit (no por etiqueta): nadie puede cambiarla por debajo.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Scan repo for A12-1309CM indicators
-        shell: bash
+      - name: Check for oversized postcss configs
         run: |
-          set -u
-          violations=0
-
-          # Files that legitimately reference the IoCs as documentation.
-          excluded_regex='^(SECURITY\.md|\.githooks/|\.github/workflows/security-scan\.yml$)'
-
-          # Build the list of tracked files, minus excluded docs and .git.
-          mapfile -t files < <(
-            git ls-files -z \
-              | tr '\0' '\n' \
-              | grep -Ev "$excluded_regex" || true
-          )
-
-          fail() {
-            echo "::error ::$*"
-            violations=$((violations + 1))
-          }
-
-          # 1) postcss.config.* size cap (500 bytes).
-          for f in "${files[@]}"; do
-            case "$f" in
-              postcss.config.*|*/postcss.config.*)
-                if [ -f "$f" ]; then
-                  size=$(wc -c < "$f" | tr -d ' ')
-                  if [ "$size" -gt 500 ]; then
-                    fail "$f is ${size} bytes (limit 500). A12-1309CM inflates postcss.config.mjs to ~33 KB."
-                  fi
-                fi
-                ;;
-            esac
+          EXIT_CODE=0
+          for f in $(find . -name 'postcss.config.*' -not -path './.git/*' -not -path '*/node_modules/*'); do
+            size=$(wc -c < "$f")
+            if [ "$size" -gt 500 ]; then
+              echo "::error file=$f::postcss config is $size bytes (limit 500) — possible payload"
+              EXIT_CODE=1
+            fi
           done
+          exit $EXIT_CODE
 
-          obfuscated_patterns=(
-            '_0x[a-f0-9]{4,}'
-            'a0_0x[a-f0-9]{4,}'
-            'createRequire.*createRequire'
-            'eval\(atob\('
-          )
-          c2_patterns=(
-            'A12-1309CM'
-            '166\.88\.134\.75'
-            '1rpc\.io/eth'
-            'eth\.drpc\.org'
-            'eth-mainnet\.public\.blastapi\.io'
-          )
-
-          scan_patterns() {
-            local label="$1"; shift
-            local pat file hit
-            for pat in "$@"; do
-              for file in "${files[@]}"; do
-                [ -f "$file" ] || continue
-                # -I skips binaries; -n gives line numbers.
-                hit=$(grep -InE "$pat" -- "$file" 2>/dev/null | head -n 3 || true)
-                if [ -n "$hit" ]; then
-                  while IFS= read -r line; do
-                    fail "$label pattern '$pat' matched in $file: $line"
-                  done <<< "$hit"
-                fi
-              done
-            done
-          }
-
-          scan_patterns "obfuscated-loader" "${obfuscated_patterns[@]}"
-          scan_patterns "C2/campaign"       "${c2_patterns[@]}"
-
-          # 2) .gitignore bot-artifact entries.
-          for f in "${files[@]}"; do
-            case "$f" in
-              .gitignore|*/.gitignore)
-                [ -f "$f" ] || continue
-                for artifact in 'branch_structure\.json' 'temp_auto_push\.bat' 'temp_interactive_push\.bat'; do
-                  hit=$(grep -nE "$artifact" -- "$f" 2>/dev/null || true)
-                  if [ -n "$hit" ]; then
-                    while IFS= read -r line; do
-                      fail ".gitignore artifact '$artifact' in $f: $line"
-                    done <<< "$hit"
-                  fi
-                done
-                ;;
-            esac
-          done
-
-          if [ "$violations" -gt 0 ]; then
-            echo ""
-            echo "::error ::A12-1309CM scan failed with $violations violation(s). See SECURITY.md."
+      - name: Check for obfuscation patterns
+        run: |
+          # Falla cerrado: si este grep no soportara -P, el control no puede quedar «verde» sin haber mirado nada.
+          echo x | grep -qP 'x' || { echo "::error::grep -P not available on this runner: the scan cannot run"; exit 1; }
+          PATTERNS='_0x[a-f0-9]{4,}|a0_0x[a-f0-9]{4,}|createRequire.*createRequire|eval\(atob\('
+          EXCLUDE='--exclude-dir=.git --exclude-dir=.githooks --exclude=SECURITY.md --exclude=security-scan.yml'
+          if grep -rPl $EXCLUDE "$PATTERNS" . 2>/dev/null; then
+            echo "::error::Obfuscated code patterns detected in the files above"
             exit 1
           fi
+          echo "No obfuscation patterns found."
 
-          echo "A12-1309CM scan clean."
+      - name: Check for C2 indicators
+        run: |
+          echo x | grep -qP 'x' || { echo "::error::grep -P not available on this runner: the scan cannot run"; exit 1; }
+          PATTERNS='A12-1309CM|166\.88\.134\.75|193\.247\.144\.38|1rpc\.io/eth|eth\.drpc\.org|eth-mainnet\.public\.blastapi\.io|ETH_RPC_URL|global\[.?_[VH].?\]|spawn\(process\.execPath'
+          EXCLUDE='--exclude-dir=.git --exclude-dir=.githooks --exclude=SECURITY.md --exclude=security-scan.yml'
+          if grep -rPl $EXCLUDE "$PATTERNS" . 2>/dev/null; then
+            echo "::error::Known C2 indicators detected in the files above"
+            exit 1
+          fi
+          echo "No C2 indicators found."
+
+      - name: Check for known attack artifacts
+        run: |
+          EXIT_CODE=0
+          while IFS= read -r -d '' f; do
+            echo "::error file=$f::known attack artifact present in the repo"
+            EXIT_CODE=1
+          done < <(find . \( -name 'temp_auto_push.bat' -o -name 'temp_interactive_push.bat' -o -name 'branch_structure.json' -o -name '.node_modules' \) -not -path './.git/*' -print0)
+          exit $EXIT_CODE
+
+      - name: Check for VS Code tasks that run on folder open
+        run: |
+          EXIT_CODE=0
+          while IFS= read -r -d '' f; do
+            if grep -qE 'folderOpen' "$f"; then
+              echo "::error file=$f::task runs automatically when the folder is opened (folderOpen)"
+              EXIT_CODE=1
+            fi
+          done < <(find . -name 'tasks.json' -not -path './.git/*' -not -path '*/node_modules/*' -print0)
+          while IFS= read -r -d '' f; do
+            if grep -qE '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*(true|"on")' "$f"; then
+              echo "::error file=$f::VS Code is set to run automatic tasks without asking"
+              EXIT_CODE=1
+            fi
+          done < <(find . -path '*/.vscode/settings.json' -not -path './.git/*' -print0)
+          exit $EXIT_CODE
+
+      - name: Check that font files are real fonts
+        run: |
+          EXIT_CODE=0
+          while IFS= read -r -d '' f; do
+            magic=$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')
+            case "$f" in
+              *.woff2) ok="774f4632" ;;
+              *.woff)  ok="774f4646" ;;
+              *.ttf)   ok="00010000 74727565" ;;
+              *.otf)   ok="4f54544f" ;;
+            esac
+            case " $ok " in
+              *" $magic "*) ;;
+              *) echo "::error file=$f::not a real font file (starts with '$magic'): looks like a script in disguise"; EXIT_CODE=1 ;;
+            esac
+          done < <(find . \( -name '*.woff2' -o -name '*.woff' -o -name '*.ttf' -o -name '*.otf' \) -not -path './.git/*' -not -path '*/node_modules/*' -print0)
+          exit $EXIT_CODE
+
+      - name: Check for hidden one-line payloads in scripts
+        run: |
+          EXIT_CODE=0
+          while IFS= read -r -d '' f; do
+            if awk 'length($0)>2000{hit=1} END{exit !hit}' "$f"; then
+              echo "::error file=$f::line longer than 2000 characters (possible hidden payload)"
+              EXIT_CODE=1
+            fi
+          done < <(find . \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.sh' -o -name '*.bat' -o -name '*.cmd' -o -name '*.ps1' \) -not -path './.git/*' -not -path '*/node_modules/*' -print0)
+          exit $EXIT_CODE
+
+      - name: Check Claude Code project settings for hooks
+        run: |
+          EXIT_CODE=0
+          for f in .claude/settings.json .claude/settings.local.json .mcp.json; do
+            if [ -f "$f" ] && grep -qE '"(hooks|mcpServers|apiKeyHelper|env)"' "$f"; then
+              echo "::error file=$f::project settings define hooks/servers/env that run when the repo is opened with Claude Code"
+              EXIT_CODE=1
+            fi
+          done
+          exit $EXIT_CODE
+
+      - name: Check .gitignore for suspicious entries
+        run: |
+          if [ -f .gitignore ]; then
+            EXIT_CODE=0
+            for pattern in "branch_structure.json" "temp_auto_push.bat" "temp_interactive_push.bat"; do
+              if grep -qF "$pattern" .gitignore; then
+                echo "::error file=.gitignore::.gitignore hides attack artifact: $pattern"
+                EXIT_CODE=1
+              fi
+            done
+            exit $EXIT_CODE
+          fi
+          echo "No .gitignore found — skipping."
